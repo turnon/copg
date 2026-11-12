@@ -1,4 +1,4 @@
-package copg
+package lib
 
 import (
 	"context"
@@ -26,18 +26,6 @@ type rowsQuerier interface {
 // rowQuerier is implemented by *pgx.Conn, pgx.Tx and pgxpool.Pool.
 type rowQuerier interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
-}
-
-// FetchColumnMeta connects to the database and returns the column metadata of
-// table. It is useful for building a shared output schema (for example a
-// Parquet schema) before calling Scanner.Run.
-func FetchColumnMeta(ctx context.Context, connString, table string) ([]ColumnMeta, error) {
-	conn, err := pgx.Connect(ctx, connString)
-	if err != nil {
-		return nil, fmt.Errorf("copg: connect: %w", err)
-	}
-	defer conn.Close(context.WithoutCancel(ctx))
-	return fetchColumnMeta(ctx, conn, table)
 }
 
 // fetchColumnMeta queries pg_attribute/pg_type for the relation identified by
@@ -78,15 +66,6 @@ func fetchColumnMeta(ctx context.Context, q rowsQuerier, table string) ([]Column
 		return nil, fmt.Errorf("copg: relation %s has no columns (does it exist?)", table)
 	}
 	return metas, nil
-}
-
-// ColumnNames returns the names of the given columns.
-func ColumnNames(cols []ColumnMeta) []string {
-	names := make([]string, len(cols))
-	for i, c := range cols {
-		names[i] = c.Name
-	}
-	return names
 }
 
 // Decoder decodes raw COPY BINARY field bytes into Go values using pgtype's

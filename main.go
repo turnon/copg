@@ -1,5 +1,5 @@
-// Command copg exports a PostgreSQL table into snapshot-consistent shards,
-// either as raw PostgreSQL COPY BINARY files or as Parquet files.
+// Command copg exports a PostgreSQL table into snapshot-consistent shards as
+// raw PostgreSQL COPY BINARY files.
 package main
 
 import (
@@ -14,7 +14,7 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/turnon/copg/copg"
+	"github.com/turnon/copg/lib"
 )
 
 type options struct {
@@ -23,9 +23,7 @@ type options struct {
 	workers       int
 	pagesPerShard int64
 	outDir        string
-	format        string
 	progressPath  string
-	batchSize     int
 }
 
 func main() {
@@ -37,15 +35,13 @@ func main() {
 	fs.IntVar(&opts.workers, "workers", 4, "maximum number of parallel shards/connections")
 	fs.Int64Var(&opts.pagesPerShard, "pages-per-shard", 1024, "target pages (8 KB each) per shard")
 	fs.StringVar(&opts.outDir, "out", "copg-out", "output directory")
-	fs.StringVar(&opts.format, "format", "parquet", "output format: parquet or binary")
 	fs.StringVar(&opts.progressPath, "progress", "", "progress file enabling resume (optional)")
-	fs.IntVar(&opts.batchSize, "batch", 1024, "rows buffered per Parquet write")
 	fs.Usage = func() {
 		fmt.Fprintf(fs.Output(), "Usage: copg -conn <dsn> -table <table> [flags]\n\nFlags:\n")
 		fs.PrintDefaults()
 		fmt.Fprintf(fs.Output(), "\nExamples:\n")
-		fmt.Fprintf(fs.Output(), "  copg -conn 'postgres://u:p@localhost/db?sslmode=disable' -table public.users -format parquet -out ./export\n")
-		fmt.Fprintf(fs.Output(), "  copg -conn 'postgres://u:p@localhost/db?sslmode=disable' -table public.users -format binary -workers 8 -progress ./export.progress\n")
+		fmt.Fprintf(fs.Output(), "  copg -conn 'postgres://u:p@localhost/db?sslmode=disable' -table public.users -out ./export\n")
+		fmt.Fprintf(fs.Output(), "  copg -conn 'postgres://u:p@localhost/db?sslmode=disable' -table public.users -workers 8 -progress ./export.progress\n")
 	}
 	fs.Parse(os.Args[1:])
 
@@ -84,30 +80,9 @@ func run(ctx context.Context, opts options) error {
 		fmt.Printf("resuming from progress file %s\n", opts.progressPath)
 	}
 
-	switch strings.ToLower(opts.format) {
-	case "binary", "copy":
-		cfg.WriterFactory = func(shardID string) (io.Writer, error) {
-			path := filepath.Join(opts.outDir, shardFileName(shardID, ".copy"))
-			return os.Create(path)
-		}
-
-	case "parquet":
-		// Fetch column metadata once so every shard writes the same schema.
-		cols, err := copg.FetchColumnMeta(ctx, opts.conn, opts.table)
-		if err != nil {
-			return err
-		}
-		schema := copg.BuildParquetSchema(opts.table, cols)
-
-		fmt.Printf("table %s has %d columns: %s\n", opts.table, len(cols), strings.Join(copg.ColumnNames(cols), ", "))
-
-		cfg.ConsumerFactory = func(shardID string) (copg.RowConsumer, error) {
-			path := filepath.Join(opts.outDir, shardFileName(shardID, ".parquet"))
-			return copg.NewParquetConsumerWithSchema(path, cols, schema, opts.batchSize)
-		}
-
-	default:
-		return fmt.Errorf("unknown format %q (want parquet or binary)", opts.format)
+	cfg.WriterFactory = func(shardID string) (io.Writer, error) {
+		path := filepath.Join(opts.outDir, shardFileName(shardID, ".copy"))
+		return os.Create(path)
 	}
 
 	fmt.Printf("exporting %s to %s with up to %d workers (%d pages per shard)\n",

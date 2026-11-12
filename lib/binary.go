@@ -1,4 +1,4 @@
-package copg
+package lib
 
 import (
 	"encoding/binary"

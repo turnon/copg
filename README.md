@@ -18,8 +18,7 @@ The export follows the same protocol orchestration as the reference docs:
 | `copg/metadata.go` | Column metadata (`pg_attribute` + OIDs) and OID-based value decoding via `pgtype.Map` |
 | `copg/progress.go` | Resume support (`ProgressStore`, file/memory implementations) |
 | `copg/consumer.go` | `RowConsumer` output abstraction |
-| `copg/parquet.go` | Parquet consumer built on `parquet-go`, plus schema derivation from PostgreSQL types |
-| `main.go` | CLI: `-format parquet` (decoded rows) or `-format binary` (raw COPY BINARY passthrough) |
+| `main.go` | CLI: parallel sharded export to raw COPY BINARY files |
 
 ## Library usage
 
@@ -38,12 +37,9 @@ scanner := copg.NewScanner(copg.Config{
 err := scanner.Run(ctx)
 ```
 
-Decoded rows into Parquet (worker-shared schema, resumable):
+Decoded rows into a custom consumer (worker-shared state, resumable):
 
 ```go
-cols, err := copg.FetchColumnMeta(ctx, dsn, "public.users")
-schema := copg.BuildParquetSchema("public.users", cols)
-
 store, err := copg.NewFileProgressStore("users.progress")
 
 scanner := copg.NewScanner(copg.Config{
@@ -52,7 +48,7 @@ scanner := copg.NewScanner(copg.Config{
 	Workers:       4,
 	ProgressStore: store,
 	ConsumerFactory: func(shardID string) (copg.RowConsumer, error) {
-		return copg.NewParquetConsumerWithSchema(shardID+".parquet", cols, schema, 4096)
+		return newMyConsumer(shardID)
 	},
 })
 err = scanner.Run(ctx)
@@ -63,36 +59,18 @@ err = scanner.Run(ctx)
 ## CLI
 
 ```sh
-# Parquet output
+# Raw COPY BINARY shards
 go run . \
   -conn 'postgres://user:pass@localhost:5432/mydb?sslmode=disable' \
-  -table public.users -format parquet -out ./export -workers 8
+  -table public.users -out ./export -workers 8
 
 # Raw COPY BINARY shards, resumable
 go run . \
   -conn 'postgres://user:pass@localhost:5432/mydb?sslmode=disable' \
-  -table public.users -format binary -out ./export -progress ./export.progress
+  -table public.users -out ./export -progress ./export.progress
 ```
 
-Flags: `-conn`, `-table`, `-out`, `-format`, `-workers`, `-pages-per-shard`, `-progress`, `-batch`. `-conn` defaults to `$COPG_CONN`.
-
-## Type mapping (Parquet)
-
-| PostgreSQL | Parquet |
-| --- | --- |
-| `bool` | BOOLEAN |
-| `int2`, `int4`, `oid` | INT(32) |
-| `int8` | INT(64) |
-| `float4` | FLOAT |
-| `float8` | DOUBLE |
-| `date` | DATE |
-| `timestamp`, `timestamptz` | TIMESTAMP(MICROS) |
-| `uuid` | UUID |
-| `json`, `jsonb` | JSON |
-| `text`, `varchar`, `bpchar`, `char`, `name`, `numeric`, `time`, `timetz`, `interval`, arrays | STRING (text form; `numeric` keeps full precision as text) |
-| everything else | BYTE_ARRAY (raw COPY BINARY bytes) |
-
-All columns are `OPTIONAL` because PostgreSQL columns are nullable. Unknown or custom types are decoded with `Decoder.FallbackRaw`, keeping raw bytes instead of failing the export.
+Flags: `-conn`, `-table`, `-out`, `-workers`, `-pages-per-shard`, `-progress`. `-conn` defaults to `$COPG_CONN`.
 
 ## Notes and limits
 

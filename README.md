@@ -147,10 +147,10 @@ go run . \
   -conn 'postgres://user:pass@localhost:5432/mydb?sslmode=disable' \
   -table public.users -out ./export -workers 8
 
-# One JSONL file per shard
+# One JSONL file per shard, with a custom file name prefix
 go run . \
   -conn 'postgres://user:pass@localhost:5432/mydb?sslmode=disable' \
-  -table public.users -format jsonl -out ./export
+  -table public.users -format jsonl -out ./export -prefix users
 
 # Only some columns, including computed ones
 go run . \
@@ -161,12 +161,14 @@ go run . \
   -column "to_char(created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at"
 ```
 
-Flags: `-conn`, `-table`, `-column`, `-format` (`raw` or `jsonl`), `-out`, `-workers`, `-pages-per-shard`. `-conn` defaults to `$COPG_CONN`.
+Flags: `-conn`, `-table`, `-column`, `-format` (`raw` or `jsonl`), `-out`, `-prefix`, `-workers`, `-pages-per-shard`. `-conn` defaults to `$COPG_CONN`.
 
-`-format raw` writes `<shard>.copy` files containing the untouched `COPY BINARY` stream. `-format jsonl` writes `<shard>.jsonl` files with one JSON object per row and the table's column names as keys, decoded through `pgtype` (`copg.NewJSONLFile`).
+`-format raw` writes `.copy` files containing the untouched `COPY BINARY` stream; `-format jsonl` writes `.jsonl` files with one JSON object per row and the table's column names as keys, decoded through `pgtype` (`copg.NewJSONLFile`).
+
+Each file is named `<prefix>.<sanitized-shard-id><ext>`, where `-prefix` defaults to `shard` and `<ext>` is `.copy` or `.jsonl`. The shard ID is `<table>@<relfilenode>:[<start>,<end>)` with every run of non-alphanumeric characters replaced by `_` (leading/trailing `_` trimmed), and the base name is capped at 100 characters. A custom prefix must consist of letters, digits, `.`, `_` or `-`:
 
 ```sh
-$ head -1 export/shard_public_users_16384_0_4096_.jsonl
+$ head -1 export/shard.public_users_16384_0_4096.jsonl
 {"id":1,"email":"a@example.com","created_at":"2024-05-06T07:08:09.123Z","score":1.50}
 ```
 

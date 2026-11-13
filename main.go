@@ -55,7 +55,7 @@ func main() {
 	fs.StringVar(&opts.table, "table", "", "table to export, optionally schema-qualified (required)")
 	fs.Var(&opts.columns, "column", "SQL expression to export, e.g. 'lower(email) AS email_lc'; repeat once per column (default: all columns)")
 	fs.IntVar(&opts.workers, "workers", 4, "maximum number of parallel shards/connections")
-	fs.Int64Var(&opts.pagesPerShard, "pages-per-shard", 1024, "target pages (8 KB each) per shard")
+	fs.Int64Var(&opts.pagesPerShard, "pages-per-shard", 8192, "target pages (8 KB each) per shard")
 	fs.StringVar(&opts.outDir, "out", "copg-out", "output directory")
 	fs.StringVar(&opts.format, "format", "raw", "output format: raw (COPY BINARY) or jsonl (one JSON object per row)")
 	fs.StringVar(&opts.prefix, "prefix", "shard", "file name prefix: files are written as <prefix>.<shard-id><ext>")

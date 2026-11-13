@@ -17,13 +17,21 @@ The export follows the same protocol orchestration as the reference docs:
 | `copg/binary.go` | Minimal PostgreSQL `COPY BINARY` stream parser |
 | `copg/metadata.go` | Column metadata (`pg_attribute` + OIDs) and OID-based value decoding via `pgtype.Map` |
 | `copg/select.go` | SELECT list resolution: explicit expressions, result descriptors, aggregate/window guard |
-| `copg/consumer.go` | `RowConsumer` / `ColumnAware` output abstractions |
-| `copg/jsonl.go` | `JSONLWriter`: one JSON object per row, columns as keys |
+| `copg/consumer.go` | `RowConsumer` output interface and the shared decode loop |
+| `copg/consumer_raw.go` | `NewRaw`: untouched COPY BINARY passthrough consumer |
+| `copg/consumer_jsonl.go` | `JSONL`: one JSON object per row, columns as keys |
 | `main.go` | CLI: parallel sharded export to raw COPY BINARY files |
 
 ## Library usage
 
-Raw COPY BINARY passthrough (no parsing, lowest overhead):
+There is one output abstraction: `copg.RowConsumer`, created per shard by
+`Config.ConsumerFactory`. The consumer receives the shard and its worker
+connection, so it decides for itself how to write the data — no mode switch, no
+capability checks, and no special cases in the scanner.
+
+Raw COPY BINARY passthrough (no parsing, lowest overhead) wraps an `io.Writer`
+with `copg.NewRaw`, which returns a `RowConsumer` whose shard bytes are the
+untouched `COPY BINARY` stream:
 
 ```go
 scanner := copg.NewScanner(copg.Config{
@@ -31,14 +39,18 @@ scanner := copg.NewScanner(copg.Config{
 	Table:         "public.users",
 	Workers:       8,
 	PagesPerShard: 2048,
-	WriterFactory: func(shardID string) (io.Writer, error) {
-		return os.Create(shardFileName(shardID) + ".copy")
+	ConsumerFactory: func(shardID string) (copg.RowConsumer, error) {
+		f, err := os.Create(shardFileName(shardID) + ".copy")
+		if err != nil {
+			return nil, err
+		}
+		return copg.NewRaw(f), nil
 	},
 })
 err := scanner.Run(ctx)
 ```
 
-Decoded rows into a custom consumer:
+Decoded rows into a custom consumer (you decode the stream in `Consume`, as `JSONL` does):
 
 ```go
 scanner := copg.NewScanner(copg.Config{
@@ -65,9 +77,38 @@ scanner := copg.NewScanner(copg.Config{
 err := scanner.Run(ctx)
 ```
 
-Consumers that need column names implement `copg.ColumnAware`; the scanner calls `Columns` once per shard before the first `Consume`. `JSONLWriter` does. The value mapping is documented on the type: timestamps become RFC 3339, `numeric` stays a JSON number (NaN/±Infinity become strings), `uuid` becomes a canonical string, `interval` becomes PostgreSQL's text form, arrays become JSON arrays, and `bytea` or types `pgtype` cannot decode become base64.
+`RowConsumer` is a single method pair:
 
-`WriterFactory` and `ConsumerFactory` receive a stable shard ID of the form `public.users@16384:[0,4096)`, which is deterministic for a given table content (it includes the table name, `relfilenode` and page range).
+```go
+type RowConsumer interface {
+	Consume(ctx context.Context, conn *pgx.Conn, sql string, cols []copg.ColumnMeta) error
+	Close() error
+}
+```
+
+- `copg.NewRaw(w)` implements it by copying `sql`'s `COPY BINARY` stream into
+  `w` untouched.
+- `copg.JSONL` implements it by decoding the stream itself (the shared
+  `copyRows` loop in `consumer.go`) and encoding each row as JSON.
+
+`conn` is a worker connection inside the exported snapshot, so the consumer
+never deals with transactions, snapshots or shard boundaries.
+
+Both implementations live in the core package:
+
+| Constructor | Output |
+| --- | --- |
+| `copg.NewRaw(w)` | untouched `COPY BINARY` stream |
+| `copg.NewJSONL(w)` | one JSON object per row, buffered |
+| `copg.NewJSONLFile(path)` | same, into a file that `Close` closes |
+
+The scanner closes every consumer once its shard is finished. A raw consumer's
+`Close` closes the wrapped writer if it implements `io.Closer`; `copg.JSONL`
+flushes and closes its file.
+
+`Consume` receives the exported columns, so consumers can use names instead of positional indexes; `copg.JSONL` does. The value mapping is documented on the type: timestamps become RFC 3339, `numeric` stays a JSON number (NaN/±Infinity become strings), `uuid` becomes a canonical string, `interval` becomes PostgreSQL's text form, arrays become JSON arrays, and `bytea` or types `pgtype` cannot decode become base64.
+
+`ConsumerFactory` receives a stable shard ID of the form `public.users@16384:[0,4096)`, which is deterministic for a given table content (it includes the table name, `relfilenode` and page range).
 
 ## Column selection and expressions
 
@@ -122,7 +163,7 @@ go run . \
 
 Flags: `-conn`, `-table`, `-column`, `-format` (`raw` or `jsonl`), `-out`, `-workers`, `-pages-per-shard`. `-conn` defaults to `$COPG_CONN`.
 
-`-format raw` writes `<shard>.copy` files containing the untouched `COPY BINARY` stream. `-format jsonl` writes `<shard>.jsonl` files with one JSON object per row and the table's column names as keys, decoded through `pgtype`.
+`-format raw` writes `<shard>.copy` files containing the untouched `COPY BINARY` stream. `-format jsonl` writes `<shard>.jsonl` files with one JSON object per row and the table's column names as keys, decoded through `pgtype` (`copg.NewJSONLFile`).
 
 ```sh
 $ head -1 export/shard_public_users_16384_0_4096_.jsonl

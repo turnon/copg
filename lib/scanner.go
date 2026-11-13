@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"math"
 	"regexp"
 	"strings"
@@ -45,20 +44,10 @@ type Config struct {
 	// shards. Defaults to 1024 (~8 MB per shard).
 	PagesPerShard int64
 
-	// ConsumerFactory creates a decoded row consumer per shard. When set,
-	// rows are parsed from the COPY BINARY stream and handed to the consumer
-	// one by one.
+	// ConsumerFactory creates the output for one shard. The consumer runs the
+	// shard's COPY itself: either pass the stream through untouched
+	// (NewRaw) or decode rows themselves, like JSONL does.
 	ConsumerFactory func(shardID string) (RowConsumer, error)
-
-	// WriterFactory creates a raw COPY BINARY sink per shard. The stream is
-	// passed through untouched. Writers returned by the factory are closed by
-	// the scanner if they implement io.Closer.
-	WriterFactory func(shardID string) (io.Writer, error)
-
-	// Writers are pre-created raw COPY BINARY sinks, indexed by planned shard
-	// order. They are not closed by the scanner. Use WriterFactory when the
-	// number of shards is not known in advance.
-	Writers []io.Writer
 }
 
 // Shard describes one immutable ctid page range. Start is inclusive, End is
@@ -159,10 +148,6 @@ func (s *Scanner) Run(ctx context.Context) error {
 
 	shards := planShards(cfg.Table, rel.RelFilenode, nblocks, cfg.PagesPerShard)
 
-	if cfg.ConsumerFactory == nil && cfg.WriterFactory == nil && len(cfg.Writers) < len(shards) {
-		return fmt.Errorf("copg: %d raw writers provided but %d shards planned; provide WriterFactory or more Writers", len(cfg.Writers), len(shards))
-	}
-
 	// ---------- Phase 3: parallel COPY workers ----------
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -184,7 +169,7 @@ func (s *Scanner) Run(ctx context.Context) error {
 			defer wg.Done()
 			for idx := range jobs {
 				shard := shards[idx]
-				if err := s.runShard(runCtx, snapshotID, shard, selectList, cols, idx); err != nil {
+				if err := s.runShard(runCtx, snapshotID, shard, selectList, cols); err != nil {
 					errCh <- fmt.Errorf("copg: shard %s: %w", shard.ID, err)
 					cancel() // stop sibling workers early
 					return
@@ -239,74 +224,34 @@ func (c Config) validate() error {
 			return fmt.Errorf("copg: Columns[%d] is empty", i)
 		}
 	}
-	if c.ConsumerFactory == nil && c.WriterFactory == nil && len(c.Writers) == 0 {
-		return errors.New("copg: no output configured (set ConsumerFactory, WriterFactory or Writers)")
+	if c.ConsumerFactory == nil {
+		return errors.New("copg: no output configured (set ConsumerFactory)")
 	}
 	return nil
 }
 
 // runShard creates the configured output and exports one shard into it.
-func (s *Scanner) runShard(ctx context.Context, snapshotID string, shard Shard, selectList string, cols []ColumnMeta, idx int) error {
-	cfg := s.cfg
-
-	var consumer RowConsumer
-	var raw io.Writer
-	closeRaw := false
-
-	switch {
-	case cfg.ConsumerFactory != nil:
-		c, err := cfg.ConsumerFactory(shard.ID)
-		if err != nil {
-			return fmt.Errorf("create consumer: %w", err)
-		}
-		if c == nil {
-			return errors.New("consumer factory returned nil")
-		}
-		consumer = c
-
-	case cfg.WriterFactory != nil:
-		w, err := cfg.WriterFactory(shard.ID)
-		if err != nil {
-			return fmt.Errorf("create writer: %w", err)
-		}
-		if w == nil {
-			return errors.New("writer factory returned nil")
-		}
-		raw = w
-		closeRaw = true
-
-	default:
-		raw = cfg.Writers[idx]
+func (s *Scanner) runShard(ctx context.Context, snapshotID string, shard Shard, selectList string, cols []ColumnMeta) error {
+	consumer, err := s.cfg.ConsumerFactory(shard.ID)
+	if err != nil {
+		return fmt.Errorf("create consumer: %w", err)
+	}
+	if consumer == nil {
+		return errors.New("consumer factory returned nil")
 	}
 
-	// Consumers that expose column names (such as JSONLWriter) get the layout
-	// before any row arrives. Asserting on a nil consumer simply fails.
-	if aware, ok := consumer.(ColumnAware); ok {
-		aware.Columns(cols)
-	}
-
-	err := s.copyWorker(ctx, snapshotID, shard, selectList, cols, consumer, raw)
+	err = s.copyWorker(ctx, snapshotID, shard, selectList, cols, consumer)
 
 	// Always release resources, whether the copy succeeded or not.
-	if consumer != nil {
-		if cerr := consumer.Close(); cerr != nil && err == nil {
-			err = fmt.Errorf("close consumer: %w", cerr)
-		}
-	}
-	if closeRaw {
-		if c, ok := raw.(io.Closer); ok {
-			if cerr := c.Close(); cerr != nil && err == nil {
-				err = fmt.Errorf("close writer: %w", cerr)
-			}
-		}
+	if cerr := consumer.Close(); cerr != nil && err == nil {
+		err = fmt.Errorf("close consumer: %w", cerr)
 	}
 	return err
 }
 
-// copyWorker imports the exported snapshot on its own connection and streams
-// the assigned ctid range, either verbatim (raw != nil) or row by row into the
-// consumer.
-func (s *Scanner) copyWorker(ctx context.Context, snapshotID string, shard Shard, selectList string, cols []ColumnMeta, consumer RowConsumer, raw io.Writer) error {
+// copyWorker imports the exported snapshot on its own connection and lets the
+// consumer export the assigned ctid range.
+func (s *Scanner) copyWorker(ctx context.Context, snapshotID string, shard Shard, selectList string, cols []ColumnMeta, consumer RowConsumer) error {
 	conn, err := pgx.Connect(ctx, s.cfg.ConnString)
 	if err != nil {
 		return fmt.Errorf("worker connect: %w", err)
@@ -329,62 +274,7 @@ func (s *Scanner) copyWorker(ctx context.Context, snapshotID string, shard Shard
 	}
 
 	sql := buildCopySQL(s.cfg.Table, selectList, shard)
-
-	if consumer == nil {
-		if raw == nil {
-			return errors.New("no output target for shard")
-		}
-		if _, err := conn.PgConn().CopyTo(ctx, raw, sql); err != nil {
-			return fmt.Errorf("copy to stdout: %w", err)
-		}
-		return nil
-	}
-	return copyIntoConsumer(ctx, conn, sql, cols, consumer)
-}
-
-// copyIntoConsumer pipes the server's COPY BINARY stream into a BinaryReader
-// and decodes each row before handing it to consumer. io.Pipe provides
-// backpressure, keeping memory usage bounded.
-func copyIntoConsumer(ctx context.Context, conn *pgx.Conn, sql string, cols []ColumnMeta, consumer RowConsumer) error {
-	pr, pw := io.Pipe()
-	copyErrCh := make(chan error, 1)
-
-	go func() {
-		_, err := conn.PgConn().CopyTo(ctx, pw, sql)
-		pw.CloseWithError(err)
-		copyErrCh <- err
-	}()
-
-	decoder := NewDecoder()
-	// Unknown/custom types are kept as raw bytes rather than failing the
-	// whole export; the output layer decides how to represent them.
-	decoder.FallbackRaw = true
-	reader := NewBinaryReader(pr)
-
-	for {
-		row, err := ReadDecodedRow(reader, decoder, cols)
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			pr.CloseWithError(err)
-			<-copyErrCh
-			return fmt.Errorf("read row: %w", err)
-		}
-		if err := consumer.Consume(ctx, row); err != nil {
-			pr.CloseWithError(err)
-			<-copyErrCh
-			return fmt.Errorf("consume row: %w", err)
-		}
-	}
-
-	if err := <-copyErrCh; err != nil {
-		pr.Close()
-		return fmt.Errorf("copy to stdout: %w", err)
-	}
-	pr.Close()
-	// The consumer is closed by the caller once all rows have been consumed.
-	return nil
+	return consumer.Consume(ctx, conn, sql, cols)
 }
 
 // buildCopySQL wraps the ctid-filtered SELECT in COPY ... TO STDOUT (FORMAT

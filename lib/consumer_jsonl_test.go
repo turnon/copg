@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"math"
 	"math/big"
 	"os"
@@ -14,20 +15,23 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-func TestJSONLWriterConsume(t *testing.T) {
-	var buf bytes.Buffer
-	jw := NewJSONLWriter(&buf)
-	jw.Columns([]ColumnMeta{{Name: "id"}, {Name: "name"}, {Name: "score"}, {Name: "tags"}})
+// JSONL must satisfy the only output interface; NewRaw enforces its own
+// conformance through its return type.
+var _ RowConsumer = NewJSONL(io.Discard)
 
-	ctx := context.Background()
+func TestJSONLConsume(t *testing.T) {
+	var buf bytes.Buffer
+	jw := NewJSONL(&buf)
+	cols := []ColumnMeta{{Name: "id"}, {Name: "name"}, {Name: "score"}, {Name: "tags"}}
+
 	rows := []*DecodedRow{
 		{Values: []any{int64(1), "alice", 1.5, []any{"a", "b"}}},
 		{Values: []any{int64(2), nil, 0.0, []any{}}},
 		{Values: []any{int64(3), "line\nbreak \"quoted\"", -0.25, nil}},
 	}
 	for _, r := range rows {
-		if err := jw.Consume(ctx, r); err != nil {
-			t.Fatalf("Consume: %v", err)
+		if err := jw.consumeRow(cols, r); err != nil {
+			t.Fatalf("consumeRow: %v", err)
 		}
 	}
 	if err := jw.Close(); err != nil {
@@ -57,12 +61,12 @@ func TestJSONLWriterConsume(t *testing.T) {
 	}
 }
 
-func TestJSONLWriterColumnOrder(t *testing.T) {
+func TestJSONLColumnOrder(t *testing.T) {
 	var buf bytes.Buffer
-	jw := NewJSONLWriter(&buf)
+	jw := NewJSONL(&buf)
 	// Deliberately not alphabetical: output must follow the table's order.
-	jw.Columns([]ColumnMeta{{Name: "z"}, {Name: "a"}})
-	if err := jw.Consume(context.Background(), &DecodedRow{Values: []any{int64(1), int64(2)}}); err != nil {
+	cols := []ColumnMeta{{Name: "z"}, {Name: "a"}}
+	if err := jw.consumeRow(cols, &DecodedRow{Values: []any{int64(1), int64(2)}}); err != nil {
 		t.Fatal(err)
 	}
 	if err := jw.Close(); err != nil {
@@ -73,15 +77,16 @@ func TestJSONLWriterColumnOrder(t *testing.T) {
 	}
 }
 
-func TestJSONLWriterRequiresColumns(t *testing.T) {
-	jw := NewJSONLWriter(&bytes.Buffer{})
-	err := jw.Consume(context.Background(), &DecodedRow{Values: []any{int64(1)}})
+func TestJSONLRequiresColumns(t *testing.T) {
+	jw := NewJSONL(&bytes.Buffer{})
+	// nil conn is safe: Consume rejects the missing metadata first.
+	err := jw.Consume(context.Background(), nil, "", nil)
 	if err == nil || !strings.Contains(err.Error(), "no column metadata") {
 		t.Fatalf("got %v, want a missing-metadata error", err)
 	}
 }
 
-func TestJSONLWriterValueTypes(t *testing.T) {
+func TestJSONLValueTypes(t *testing.T) {
 	ts := time.Date(2024, 5, 6, 7, 8, 9, 123000000, time.UTC)
 	uuid := [16]byte{0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
 		0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88}
@@ -129,14 +134,13 @@ func TestJSONLWriterValueTypes(t *testing.T) {
 	}
 }
 
-func TestJSONLWriterClosesFile(t *testing.T) {
+func TestJSONLClosesFile(t *testing.T) {
 	path := t.TempDir() + "/shard.jsonl"
 	jw, err := NewJSONLFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	jw.Columns([]ColumnMeta{{Name: "n"}})
-	if err := jw.Consume(context.Background(), &DecodedRow{Values: []any{int64(42)}}); err != nil {
+	if err := jw.consumeRow([]ColumnMeta{{Name: "n"}}, &DecodedRow{Values: []any{int64(42)}}); err != nil {
 		t.Fatal(err)
 	}
 	if err := jw.Close(); err != nil {

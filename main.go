@@ -7,7 +7,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -119,9 +118,13 @@ func run(ctx context.Context, opts options, columns []string) error {
 
 	switch opts.format {
 	case formatRaw:
-		cfg.WriterFactory = func(shardID string) (io.Writer, error) {
+		cfg.ConsumerFactory = func(shardID string) (lib.RowConsumer, error) {
 			path := filepath.Join(opts.outDir, shardFileName(shardID, ".copy"))
-			return os.Create(path)
+			f, err := os.Create(path)
+			if err != nil {
+				return nil, err
+			}
+			return lib.NewRaw(f), nil
 		}
 	case formatJSONL:
 		cfg.ConsumerFactory = func(shardID string) (lib.RowConsumer, error) {

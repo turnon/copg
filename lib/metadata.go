@@ -120,10 +120,10 @@ func (r *DecodedRow) Map(cols []ColumnMeta) map[string]any {
 	return m
 }
 
-// ReadDecodedRow reads the next row from br and decodes each field according to
+// readDecodedRow reads the next row from br and decodes each field according to
 // the column metadata. It returns io.EOF at the end of the stream.
-func ReadDecodedRow(br *BinaryReader, decoder *Decoder, cols []ColumnMeta) (*DecodedRow, error) {
-	raw, err := br.ReadRow()
+func readDecodedRow(br *binaryReader, decoder *Decoder, cols []ColumnMeta) (*DecodedRow, error) {
+	raw, err := br.readRow()
 	if err != nil {
 		return nil, err
 	}

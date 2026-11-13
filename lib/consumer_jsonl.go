@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
@@ -22,12 +23,11 @@ import (
 // so a shard does not turn into one syscall per row.
 const jsonlBufferSize = 64 << 10
 
-// JSONLWriter is a RowConsumer that writes one JSON object per row, using the
+// JSONL is a RowConsumer that writes one JSON object per row, using the
 // exported table's column names as keys and preserving column order.
 //
-// It implements ColumnAware: the Scanner hands it the column metadata once,
-// before the first Consume call. Without that metadata it cannot name fields
-// and Consume fails.
+// Consume receives the exported column metadata and uses the names as JSON
+// keys, so computed columns keep the alias from their SELECT expression.
 //
 // Type mapping (decoded values come from pgtype, see Decoder):
 //
@@ -41,45 +41,48 @@ const jsonlBufferSize = 64 << 10
 //	arrays                             -> JSON arrays, element-wise
 //	bytea and types pgtype cannot decode -> base64 string
 //
-// JSONLWriter is not safe for concurrent use; create one per shard.
-type JSONLWriter struct {
+// JSONL is not safe for concurrent use; create one per shard.
+type JSONL struct {
 	w      *bufio.Writer
 	closer io.Closer
-	cols   []ColumnMeta
 	line   []byte
 	closed bool
 }
 
-// NewJSONLWriter returns a JSONLWriter that writes to w. Close flushes w but
-// does not close it, so callers can keep ownership of stdout and friends.
-func NewJSONLWriter(w io.Writer) *JSONLWriter {
-	return &JSONLWriter{w: bufio.NewWriterSize(w, jsonlBufferSize)}
+// NewJSONL returns a JSONL consumer that writes to w. Close flushes w but does
+// not close it, so callers can keep ownership of stdout and friends.
+func NewJSONL(w io.Writer) *JSONL {
+	return &JSONL{w: bufio.NewWriterSize(w, jsonlBufferSize)}
 }
 
-// NewJSONLFile creates (or truncates) path and returns a JSONLWriter that
+// NewJSONLFile creates (or truncates) path and returns a JSONL consumer that
 // writes to it. Close flushes and closes the file.
-func NewJSONLFile(path string) (*JSONLWriter, error) {
+func NewJSONLFile(path string) (*JSONL, error) {
 	f, err := os.Create(path)
 	if err != nil {
 		return nil, err
 	}
-	jw := NewJSONLWriter(f)
+	jw := NewJSONL(f)
 	jw.closer = f
 	return jw, nil
 }
 
-// Columns implements ColumnAware.
-func (j *JSONLWriter) Columns(cols []ColumnMeta) {
-	j.cols = cols
+// Consume implements RowConsumer: it decodes the shard's COPY BINARY
+// stream and writes one JSON object per row.
+func (j *JSONL) Consume(ctx context.Context, conn *pgx.Conn, sql string, cols []ColumnMeta) error {
+	if len(cols) == 0 {
+		return fmt.Errorf("copg: jsonl: no column metadata")
+	}
+	return copyRows(ctx, conn, sql, cols, func(row *DecodedRow) error {
+		return j.consumeRow(cols, row)
+	})
 }
 
-// Consume implements RowConsumer.
-func (j *JSONLWriter) Consume(_ context.Context, row *DecodedRow) error {
-	if len(j.cols) == 0 {
-		return fmt.Errorf("copg: jsonl: no column metadata; Columns was not called")
-	}
-	if len(row.Values) != len(j.cols) {
-		return fmt.Errorf("copg: jsonl: row has %d values, metadata has %d columns", len(row.Values), len(j.cols))
+// consumeRow writes one decoded row. It is separate from Consume so the
+// encoding can be tested without a database.
+func (j *JSONL) consumeRow(cols []ColumnMeta, row *DecodedRow) error {
+	if len(row.Values) != len(cols) {
+		return fmt.Errorf("copg: jsonl: row has %d values, metadata has %d columns", len(row.Values), len(cols))
 	}
 
 	line := j.line[:0]
@@ -88,13 +91,13 @@ func (j *JSONLWriter) Consume(_ context.Context, row *DecodedRow) error {
 		if i > 0 {
 			line = append(line, ',')
 		}
-		line = appendJSONString(line, j.cols[i].Name)
+		line = appendJSONString(line, cols[i].Name)
 		line = append(line, ':')
 		var err error
 		line, err = appendJSONValue(line, v)
 		if err != nil {
 			j.line = line
-			return fmt.Errorf("copg: jsonl: column %s: %w", j.cols[i].Name, err)
+			return fmt.Errorf("copg: jsonl: column %s: %w", cols[i].Name, err)
 		}
 	}
 	line = append(line, '}', '\n')
@@ -107,7 +110,7 @@ func (j *JSONLWriter) Consume(_ context.Context, row *DecodedRow) error {
 }
 
 // Close implements RowConsumer. It is safe to call more than once.
-func (j *JSONLWriter) Close() error {
+func (j *JSONL) Close() error {
 	if j.closed {
 		return nil
 	}

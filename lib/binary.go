@@ -10,31 +10,27 @@ import (
 // COPY BINARY stream.
 const copyBinarySignature = "PGCOPY\n\xff\r\n\x00"
 
-// Row is one decoded (but not type-decoded) tuple from a COPY BINARY stream.
-// A nil field represents SQL NULL.
-type Row [][]byte
-
-// BinaryReader reads rows from a PostgreSQL COPY ... (FORMAT BINARY) stream.
+// binaryReader reads rows from a PostgreSQL COPY ... (FORMAT BINARY) stream.
 //
 // Format reference:
 //
 //	header:  11-byte signature, int32 flags, int32 extension length
 //	tuple:   int16 field count, then per field int32 length + bytes (-1 = NULL)
 //	trailer: int16 -1
-type BinaryReader struct {
+type binaryReader struct {
 	r          io.Reader
 	headerRead bool
 	trailer    bool
 }
 
-// NewBinaryReader returns a reader that parses the COPY BINARY data from r.
-func NewBinaryReader(r io.Reader) *BinaryReader {
-	return &BinaryReader{r: r}
+// newBinaryReader returns a reader that parses the COPY BINARY data from r.
+func newBinaryReader(r io.Reader) *binaryReader {
+	return &binaryReader{r: r}
 }
 
-// ReadRow returns the next row. It returns io.EOF after the stream trailer has
-// been consumed.
-func (br *BinaryReader) ReadRow() (Row, error) {
+// readRow returns the next row, with a nil field for SQL NULL. It returns
+// io.EOF after the stream trailer has been consumed.
+func (br *binaryReader) readRow() ([][]byte, error) {
 	if !br.headerRead {
 		if err := br.readHeader(); err != nil {
 			return nil, err
@@ -57,7 +53,7 @@ func (br *BinaryReader) ReadRow() (Row, error) {
 		return nil, fmt.Errorf("copg: invalid field count %d", fieldCount)
 	}
 
-	row := make(Row, int(fieldCount))
+	row := make([][]byte, int(fieldCount))
 	for i := range row {
 		var length int32
 		if err := binary.Read(br.r, binary.BigEndian, &length); err != nil {
@@ -79,7 +75,7 @@ func (br *BinaryReader) ReadRow() (Row, error) {
 	return row, nil
 }
 
-func (br *BinaryReader) readHeader() error {
+func (br *binaryReader) readHeader() error {
 	header := make([]byte, 19) // signature (11) + flags (4) + extension length (4)
 	if _, err := io.ReadFull(br.r, header); err != nil {
 		return fmt.Errorf("copg: read COPY binary header: %w", err)

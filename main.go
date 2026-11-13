@@ -17,12 +17,18 @@ import (
 	"github.com/turnon/copg/lib"
 )
 
+const (
+	formatRaw   = "raw"
+	formatJSONL = "jsonl"
+)
+
 type options struct {
 	conn          string
 	table         string
 	workers       int
 	pagesPerShard int64
 	outDir        string
+	format        string
 }
 
 func main() {
@@ -34,17 +40,25 @@ func main() {
 	fs.IntVar(&opts.workers, "workers", 4, "maximum number of parallel shards/connections")
 	fs.Int64Var(&opts.pagesPerShard, "pages-per-shard", 1024, "target pages (8 KB each) per shard")
 	fs.StringVar(&opts.outDir, "out", "copg-out", "output directory")
+	fs.StringVar(&opts.format, "format", "raw", "output format: raw (COPY BINARY) or jsonl (one JSON object per row)")
 	fs.Usage = func() {
 		fmt.Fprintf(fs.Output(), "Usage: copg -conn <dsn> -table <table> [flags]\n\nFlags:\n")
 		fs.PrintDefaults()
 		fmt.Fprintf(fs.Output(), "\nExamples:\n")
 		fmt.Fprintf(fs.Output(), "  copg -conn 'postgres://u:p@localhost/db?sslmode=disable' -table public.users -out ./export\n")
+		fmt.Fprintf(fs.Output(), "  copg -conn 'postgres://u:p@localhost/db?sslmode=disable' -table public.users -format jsonl -out ./export\n")
 		fmt.Fprintf(fs.Output(), "  copg -conn 'postgres://u:p@localhost/db?sslmode=disable' -table public.users -workers 8 -out ./export\n")
 	}
 	fs.Parse(os.Args[1:])
 
 	if opts.conn == "" || opts.table == "" {
 		fs.Usage()
+		os.Exit(2)
+	}
+	switch opts.format {
+	case formatRaw, formatJSONL:
+	default:
+		fmt.Fprintf(os.Stderr, "copg: unknown -format %q (want %q or %q)\n", opts.format, formatRaw, formatJSONL)
 		os.Exit(2)
 	}
 
@@ -69,13 +83,20 @@ func run(ctx context.Context, opts options) error {
 		PagesPerShard: opts.pagesPerShard,
 	}
 
-	cfg.WriterFactory = func(shardID string) (io.Writer, error) {
-		path := filepath.Join(opts.outDir, shardFileName(shardID, ".copy"))
-		return os.Create(path)
+	switch opts.format {
+	case formatRaw:
+		cfg.WriterFactory = func(shardID string) (io.Writer, error) {
+			path := filepath.Join(opts.outDir, shardFileName(shardID, ".copy"))
+			return os.Create(path)
+		}
+	case formatJSONL:
+		cfg.ConsumerFactory = func(shardID string) (lib.RowConsumer, error) {
+			return lib.NewJSONLFile(filepath.Join(opts.outDir, shardFileName(shardID, ".jsonl")))
+		}
 	}
 
-	fmt.Printf("exporting %s to %s with up to %d workers (%d pages per shard)\n",
-		opts.table, opts.outDir, opts.workers, opts.pagesPerShard)
+	fmt.Printf("exporting %s to %s as %s with up to %d workers (%d pages per shard)\n",
+		opts.table, opts.outDir, opts.format, opts.workers, opts.pagesPerShard)
 
 	scanner := lib.NewScanner(cfg)
 	if err := scanner.Run(ctx); err != nil {

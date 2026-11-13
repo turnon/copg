@@ -263,6 +263,12 @@ func (s *Scanner) runShard(ctx context.Context, snapshotID string, shard Shard, 
 		raw = cfg.Writers[idx]
 	}
 
+	// Consumers that expose column names (such as JSONLWriter) get the layout
+	// before any row arrives. Asserting on a nil consumer simply fails.
+	if aware, ok := consumer.(ColumnAware); ok {
+		aware.Columns(cols)
+	}
+
 	err := s.copyWorker(ctx, snapshotID, shard, cols, consumer, raw)
 
 	// Always release resources, whether the copy succeeded or not.

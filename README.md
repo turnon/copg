@@ -16,7 +16,8 @@ The export follows the same protocol orchestration as the reference docs:
 | `copg/scanner.go` | Snapshot export orchestration, ctid shard planning, worker pool |
 | `copg/binary.go` | Minimal PostgreSQL `COPY BINARY` stream parser |
 | `copg/metadata.go` | Column metadata (`pg_attribute` + OIDs) and OID-based value decoding via `pgtype.Map` |
-| `copg/consumer.go` | `RowConsumer` output abstraction |
+| `copg/consumer.go` | `RowConsumer` / `ColumnAware` output abstractions |
+| `copg/jsonl.go` | `JSONLWriter`: one JSON object per row, columns as keys |
 | `main.go` | CLI: parallel sharded export to raw COPY BINARY files |
 
 ## Library usage
@@ -50,18 +51,45 @@ scanner := copg.NewScanner(copg.Config{
 err = scanner.Run(ctx)
 ```
 
+Each shard as newline-delimited JSON (one object per row, column names as keys):
+
+```go
+scanner := copg.NewScanner(copg.Config{
+	ConnString:    dsn,
+	Table:         "public.users",
+	ConsumerFactory: func(shardID string) (copg.RowConsumer, error) {
+		return copg.NewJSONLFile(shardFileName(shardID) + ".jsonl")
+	},
+})
+err := scanner.Run(ctx)
+```
+
+Consumers that need column names implement `copg.ColumnAware`; the scanner calls `Columns` once per shard before the first `Consume`. `JSONLWriter` does. The value mapping is documented on the type: timestamps become RFC 3339, `numeric` stays a JSON number (NaN/±Infinity become strings), `uuid` becomes a canonical string, `interval` becomes PostgreSQL's text form, arrays become JSON arrays, and `bytea` or types `pgtype` cannot decode become base64.
+
 `WriterFactory` and `ConsumerFactory` receive a stable shard ID of the form `public.users@16384:[0,4096)`, which is deterministic for a given table content (it includes the table name, `relfilenode` and page range).
 
 ## CLI
 
 ```sh
-# Raw COPY BINARY shards
+# Raw COPY BINARY shards (default)
 go run . \
   -conn 'postgres://user:pass@localhost:5432/mydb?sslmode=disable' \
   -table public.users -out ./export -workers 8
+
+# One JSONL file per shard
+go run . \
+  -conn 'postgres://user:pass@localhost:5432/mydb?sslmode=disable' \
+  -table public.users -format jsonl -out ./export
 ```
 
-Flags: `-conn`, `-table`, `-out`, `-workers`, `-pages-per-shard`. `-conn` defaults to `$COPG_CONN`.
+Flags: `-conn`, `-table`, `-format` (`raw` or `jsonl`), `-out`, `-workers`, `-pages-per-shard`. `-conn` defaults to `$COPG_CONN`.
+
+`-format raw` writes `<shard>.copy` files containing the untouched `COPY BINARY` stream. `-format jsonl` writes `<shard>.jsonl` files with one JSON object per row and the table's column names as keys, decoded through `pgtype`.
+
+```sh
+$ head -1 export/shard_public_users_16384_0_4096_.jsonl
+{"id":1,"email":"a@example.com","created_at":"2024-05-06T07:08:09.123Z","score":1.50}
+```
 
 ## Notes and limits
 

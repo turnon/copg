@@ -30,13 +30,9 @@ type Config struct {
 	Workers int
 
 	// PagesPerShard is the target number of 8 KB pages covered by one shard;
-	// it controls shard granularity and therefore resume granularity. Larger
-	// values mean fewer, longer-running shards. Defaults to 1024 (~8 MB per
-	// shard).
+	// it controls shard granularity. Larger values mean fewer, longer-running
+	// shards. Defaults to 1024 (~8 MB per shard).
 	PagesPerShard int64
-
-	// ProgressStore optionally records completed shards for resume support.
-	ProgressStore ProgressStore
 
 	// ConsumerFactory creates a decoded row consumer per shard. When set,
 	// rows are parsed from the COPY BINARY stream and handed to the consumer
@@ -58,7 +54,7 @@ type Config struct {
 // exclusive.
 type Shard struct {
 	// ID is stable for a given table content: it contains the table name, the
-	// relfilenode and the page range. It is used as the resume key.
+	// relfilenode and the page range.
 	ID string
 	// Table is the exported relation.
 	Table string
@@ -94,7 +90,7 @@ func NewScanner(cfg Config) *Scanner {
 //     export its snapshot with pg_export_snapshot().
 //  2. Read column metadata and split the relation's page space into ctid
 //     ranges.
-//  3. For every incomplete shard, open a worker connection, import the
+//  3. For every shard, open a worker connection, import the
 //     snapshot with SET TRANSACTION SNAPSHOT, and stream
 //     COPY (SELECT ... WHERE ctid ...) TO STDOUT (FORMAT BINARY).
 //
@@ -160,67 +156,42 @@ func (s *Scanner) Run(ctx context.Context) error {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// Decide which shards still need to run.
-	pending := make([]int, 0, len(shards))
-	for i, shard := range shards {
-		if cfg.ProgressStore != nil {
-			done, err := cfg.ProgressStore.IsCompleted(ctx, shard.ID)
-			if err != nil {
-				return fmt.Errorf("copg: check progress for shard %s: %w", shard.ID, err)
-			}
-			if done {
-				continue
-			}
-		}
-		pending = append(pending, i)
-	}
-
-	// Run the pending shards on at most cfg.Workers connections. Shards are
+	// Run every shard on at most cfg.Workers connections. Shards are
 	// independent, so a bounded worker pool keeps parallelism and shard
-	// granularity (resume points) decoupled.
-	errCh := make(chan error, len(pending)+1)
-	if len(pending) > 0 {
-		workerCount := cfg.Workers
-		if workerCount > len(pending) {
-			workerCount = len(pending)
-		}
-
-		jobs := make(chan int)
-		var wg sync.WaitGroup
-		for range workerCount {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				for idx := range jobs {
-					shard := shards[idx]
-					if err := s.runShard(runCtx, snapshotID, shard, cols, idx); err != nil {
-						errCh <- fmt.Errorf("copg: shard %s: %w", shard.ID, err)
-						cancel() // stop sibling workers early
-						return
-					}
-					if cfg.ProgressStore != nil {
-						// Record success even while a sibling is failing.
-						if err := cfg.ProgressStore.MarkCompleted(context.WithoutCancel(ctx), shard.ID); err != nil {
-							errCh <- fmt.Errorf("copg: mark shard %s completed: %w", shard.ID, err)
-							cancel()
-							return
-						}
-					}
-				}
-			}()
-		}
-
-	schedule:
-		for _, idx := range pending {
-			select {
-			case jobs <- idx:
-			case <-runCtx.Done():
-				break schedule
-			}
-		}
-		close(jobs)
-		wg.Wait()
+	// granularity decoupled.
+	errCh := make(chan error, len(shards)+1)
+	workerCount := cfg.Workers
+	if workerCount > len(shards) {
+		workerCount = len(shards)
 	}
+
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+	for range workerCount {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for idx := range jobs {
+				shard := shards[idx]
+				if err := s.runShard(runCtx, snapshotID, shard, cols, idx); err != nil {
+					errCh <- fmt.Errorf("copg: shard %s: %w", shard.ID, err)
+					cancel() // stop sibling workers early
+					return
+				}
+			}
+		}()
+	}
+
+schedule:
+	for idx := range shards {
+		select {
+		case jobs <- idx:
+		case <-runCtx.Done():
+			break schedule
+		}
+	}
+	close(jobs)
+	wg.Wait()
 	close(errCh)
 
 	if err := firstError(errCh); err != nil {
@@ -421,7 +392,7 @@ const maxShards = 1 << 14 // 16384
 
 // planShards splits [0, nblocks) into ranges of roughly pagesPerShard pages.
 // The result is deterministic for a given relfilenode and page count, which is
-// what makes shard IDs usable as resume keys.
+// what makes shard IDs stable across runs.
 func planShards(table string, relFilenode uint32, nblocks int64, pagesPerShard int64) []Shard {
 	if nblocks < 0 {
 		nblocks = 0

@@ -23,7 +23,6 @@ type options struct {
 	workers       int
 	pagesPerShard int64
 	outDir        string
-	progressPath  string
 }
 
 func main() {
@@ -35,13 +34,12 @@ func main() {
 	fs.IntVar(&opts.workers, "workers", 4, "maximum number of parallel shards/connections")
 	fs.Int64Var(&opts.pagesPerShard, "pages-per-shard", 1024, "target pages (8 KB each) per shard")
 	fs.StringVar(&opts.outDir, "out", "copg-out", "output directory")
-	fs.StringVar(&opts.progressPath, "progress", "", "progress file enabling resume (optional)")
 	fs.Usage = func() {
 		fmt.Fprintf(fs.Output(), "Usage: copg -conn <dsn> -table <table> [flags]\n\nFlags:\n")
 		fs.PrintDefaults()
 		fmt.Fprintf(fs.Output(), "\nExamples:\n")
 		fmt.Fprintf(fs.Output(), "  copg -conn 'postgres://u:p@localhost/db?sslmode=disable' -table public.users -out ./export\n")
-		fmt.Fprintf(fs.Output(), "  copg -conn 'postgres://u:p@localhost/db?sslmode=disable' -table public.users -workers 8 -progress ./export.progress\n")
+		fmt.Fprintf(fs.Output(), "  copg -conn 'postgres://u:p@localhost/db?sslmode=disable' -table public.users -workers 8 -out ./export\n")
 	}
 	fs.Parse(os.Args[1:])
 
@@ -64,20 +62,11 @@ func run(ctx context.Context, opts options) error {
 		return fmt.Errorf("create output directory: %w", err)
 	}
 
-	cfg := copg.Config{
+	cfg := lib.Config{
 		ConnString:    opts.conn,
 		Table:         opts.table,
 		Workers:       opts.workers,
 		PagesPerShard: opts.pagesPerShard,
-	}
-
-	if opts.progressPath != "" {
-		store, err := copg.NewFileProgressStore(opts.progressPath)
-		if err != nil {
-			return err
-		}
-		cfg.ProgressStore = store
-		fmt.Printf("resuming from progress file %s\n", opts.progressPath)
 	}
 
 	cfg.WriterFactory = func(shardID string) (io.Writer, error) {
@@ -88,7 +77,7 @@ func run(ctx context.Context, opts options) error {
 	fmt.Printf("exporting %s to %s with up to %d workers (%d pages per shard)\n",
 		opts.table, opts.outDir, opts.workers, opts.pagesPerShard)
 
-	scanner := copg.NewScanner(cfg)
+	scanner := lib.NewScanner(cfg)
 	if err := scanner.Run(ctx); err != nil {
 		return err
 	}

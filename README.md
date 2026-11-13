@@ -16,7 +16,6 @@ The export follows the same protocol orchestration as the reference docs:
 | `copg/scanner.go` | Snapshot export orchestration, ctid shard planning, worker pool |
 | `copg/binary.go` | Minimal PostgreSQL `COPY BINARY` stream parser |
 | `copg/metadata.go` | Column metadata (`pg_attribute` + OIDs) and OID-based value decoding via `pgtype.Map` |
-| `copg/progress.go` | Resume support (`ProgressStore`, file/memory implementations) |
 | `copg/consumer.go` | `RowConsumer` output abstraction |
 | `main.go` | CLI: parallel sharded export to raw COPY BINARY files |
 
@@ -37,16 +36,13 @@ scanner := copg.NewScanner(copg.Config{
 err := scanner.Run(ctx)
 ```
 
-Decoded rows into a custom consumer (worker-shared state, resumable):
+Decoded rows into a custom consumer:
 
 ```go
-store, err := copg.NewFileProgressStore("users.progress")
-
 scanner := copg.NewScanner(copg.Config{
 	ConnString:    dsn,
 	Table:         "public.users",
 	Workers:       4,
-	ProgressStore: store,
 	ConsumerFactory: func(shardID string) (copg.RowConsumer, error) {
 		return newMyConsumer(shardID)
 	},
@@ -54,7 +50,7 @@ scanner := copg.NewScanner(copg.Config{
 err = scanner.Run(ctx)
 ```
 
-`WriterFactory` and `ConsumerFactory` receive a stable shard ID of the form `public.users@16384:[0,4096)`, which doubles as the resume key (it includes the table name, `relfilenode` and page range).
+`WriterFactory` and `ConsumerFactory` receive a stable shard ID of the form `public.users@16384:[0,4096)`, which is deterministic for a given table content (it includes the table name, `relfilenode` and page range).
 
 ## CLI
 
@@ -63,19 +59,14 @@ err = scanner.Run(ctx)
 go run . \
   -conn 'postgres://user:pass@localhost:5432/mydb?sslmode=disable' \
   -table public.users -out ./export -workers 8
-
-# Raw COPY BINARY shards, resumable
-go run . \
-  -conn 'postgres://user:pass@localhost:5432/mydb?sslmode=disable' \
-  -table public.users -out ./export -progress ./export.progress
 ```
 
-Flags: `-conn`, `-table`, `-out`, `-workers`, `-pages-per-shard`, `-progress`. `-conn` defaults to `$COPG_CONN`.
+Flags: `-conn`, `-table`, `-out`, `-workers`, `-pages-per-shard`. `-conn` defaults to `$COPG_CONN`.
 
 ## Notes and limits
 
 - `ctid` range scans are optimized from PostgreSQL 14 onward; older versions may fall back to sequential scans and lose parallelism.
 - Every shard needs its own connection (`SET TRANSACTION SNAPSHOT` is session-scoped); keep `Workers` below `max_connections`.
-- `PagesPerShard` controls shard size, i.e. resume granularity; `Workers` only caps concurrency.
+- `PagesPerShard` controls shard size; `Workers` only caps concurrency.
 - Deleted/sparse pages produce empty shards, which is expected.
-- `FileProgressStore` appends one completed shard ID per line; a crash may leave a partial line, which is simply ignored on the next run.
+- Resume is not supported: an interrupted export is restarted from scratch. A PostgreSQL snapshot cannot outlive the session that exported it, so resuming across runs would stitch together shards from different MVCC states. Shards are deterministic and files are recreated, so a restart simply redoes the work.

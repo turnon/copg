@@ -24,6 +24,17 @@ type Config struct {
 	// example "public.users").
 	Table string
 
+	// Columns optionally replaces the export's SELECT list. Entries are SQL
+	// expressions evaluated per row against Table and are used verbatim, so
+	// "lower(email)", "id * 2" and "payload->>'k'" all work; an "AS name"
+	// suffix sets the output name that consumers such as JSONLWriter use.
+	// When empty, every live column of the relation is exported.
+	//
+	// Expressions must produce one value per input row: aggregates and window
+	// functions are rejected, because each shard scans a disjoint ctid range
+	// and would evaluate them once per shard.
+	Columns []string
+
 	// Workers is the maximum number of concurrent shard exports, i.e. the
 	// maximum number of PostgreSQL connections opened in parallel. Defaults to
 	// 4. It does not limit the number of shards.
@@ -129,7 +140,7 @@ func (s *Scanner) Run(ctx context.Context) error {
 	}
 
 	// ---------- Phase 2: metadata and ctid planning ----------
-	cols, err := fetchColumnMeta(ctx, tx, cfg.Table)
+	selectList, cols, err := prepareSelect(ctx, tx, cfg.Table, cfg.Columns)
 	if err != nil {
 		return err
 	}
@@ -173,7 +184,7 @@ func (s *Scanner) Run(ctx context.Context) error {
 			defer wg.Done()
 			for idx := range jobs {
 				shard := shards[idx]
-				if err := s.runShard(runCtx, snapshotID, shard, cols, idx); err != nil {
+				if err := s.runShard(runCtx, snapshotID, shard, selectList, cols, idx); err != nil {
 					errCh <- fmt.Errorf("copg: shard %s: %w", shard.ID, err)
 					cancel() // stop sibling workers early
 					return
@@ -223,6 +234,11 @@ func (c Config) validate() error {
 	if c.Table == "" {
 		return errors.New("copg: Table is required")
 	}
+	for i, expr := range c.Columns {
+		if strings.TrimSpace(expr) == "" {
+			return fmt.Errorf("copg: Columns[%d] is empty", i)
+		}
+	}
 	if c.ConsumerFactory == nil && c.WriterFactory == nil && len(c.Writers) == 0 {
 		return errors.New("copg: no output configured (set ConsumerFactory, WriterFactory or Writers)")
 	}
@@ -230,7 +246,7 @@ func (c Config) validate() error {
 }
 
 // runShard creates the configured output and exports one shard into it.
-func (s *Scanner) runShard(ctx context.Context, snapshotID string, shard Shard, cols []ColumnMeta, idx int) error {
+func (s *Scanner) runShard(ctx context.Context, snapshotID string, shard Shard, selectList string, cols []ColumnMeta, idx int) error {
 	cfg := s.cfg
 
 	var consumer RowConsumer
@@ -269,7 +285,7 @@ func (s *Scanner) runShard(ctx context.Context, snapshotID string, shard Shard, 
 		aware.Columns(cols)
 	}
 
-	err := s.copyWorker(ctx, snapshotID, shard, cols, consumer, raw)
+	err := s.copyWorker(ctx, snapshotID, shard, selectList, cols, consumer, raw)
 
 	// Always release resources, whether the copy succeeded or not.
 	if consumer != nil {
@@ -290,7 +306,7 @@ func (s *Scanner) runShard(ctx context.Context, snapshotID string, shard Shard, 
 // copyWorker imports the exported snapshot on its own connection and streams
 // the assigned ctid range, either verbatim (raw != nil) or row by row into the
 // consumer.
-func (s *Scanner) copyWorker(ctx context.Context, snapshotID string, shard Shard, cols []ColumnMeta, consumer RowConsumer, raw io.Writer) error {
+func (s *Scanner) copyWorker(ctx context.Context, snapshotID string, shard Shard, selectList string, cols []ColumnMeta, consumer RowConsumer, raw io.Writer) error {
 	conn, err := pgx.Connect(ctx, s.cfg.ConnString)
 	if err != nil {
 		return fmt.Errorf("worker connect: %w", err)
@@ -312,7 +328,7 @@ func (s *Scanner) copyWorker(ctx context.Context, snapshotID string, shard Shard
 		return fmt.Errorf("import snapshot: %w", err)
 	}
 
-	sql := buildCopySQL(s.cfg.Table, cols, shard)
+	sql := buildCopySQL(s.cfg.Table, selectList, shard)
 
 	if consumer == nil {
 		if raw == nil {
@@ -373,14 +389,11 @@ func copyIntoConsumer(ctx context.Context, conn *pgx.Conn, sql string, cols []Co
 
 // buildCopySQL wraps the ctid-filtered SELECT in COPY ... TO STDOUT (FORMAT
 // BINARY). An empty shard uses WHERE false so it returns a valid, empty stream.
-func buildCopySQL(table string, cols []ColumnMeta, shard Shard) string {
-	columnList := "*"
-	if len(cols) > 0 {
-		names := make([]string, len(cols))
-		for i, c := range cols {
-			names[i] = quoteIdentifier(c.Name)
-		}
-		columnList = strings.Join(names, ", ")
+// selectList is resolved by prepareSelect: either every column, or the caller's
+// expressions verbatim.
+func buildCopySQL(table, selectList string, shard Shard) string {
+	if selectList == "" {
+		selectList = "*"
 	}
 
 	where := "false"
@@ -389,7 +402,7 @@ func buildCopySQL(table string, cols []ColumnMeta, shard Shard) string {
 	}
 
 	return fmt.Sprintf("COPY (SELECT %s FROM %s WHERE %s) TO STDOUT (FORMAT BINARY)",
-		columnList, quoteIdentifier(table), where)
+		selectList, quoteIdentifier(table), where)
 }
 
 // maxShards bounds the number of planned shards so a very large table with a

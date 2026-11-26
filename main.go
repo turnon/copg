@@ -4,7 +4,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -25,26 +24,12 @@ const (
 type options struct {
 	conn          string
 	table         string
-	columns       columnList
+	selectList    string
 	workers       int
 	pagesPerShard int64
 	outDir        string
 	format        string
 	prefix        string
-}
-
-// columnList collects -column values, one expression per occurrence.
-type columnList []string
-
-func (c *columnList) String() string { return strings.Join(*c, ", ") }
-
-func (c *columnList) Set(v string) error {
-	expr := strings.TrimSpace(v)
-	if expr == "" {
-		return errors.New("empty column expression")
-	}
-	*c = append(*c, expr)
-	return nil
 }
 
 func main() {
@@ -53,7 +38,7 @@ func main() {
 	fs := flag.NewFlagSet("copg", flag.ExitOnError)
 	fs.StringVar(&opts.conn, "conn", "", "PostgreSQL connection string (default $COPG_CONN)")
 	fs.StringVar(&opts.table, "table", "", "table to export, optionally schema-qualified (required)")
-	fs.Var(&opts.columns, "column", "SQL expression to export, e.g. 'lower(email) AS email_lc'; repeat once per column (default: all columns)")
+	fs.StringVar(&opts.selectList, "select", "", "comma-separated SQL expressions to export, e.g. 'id, lower(email) AS email_lc' (default: all columns)")
 	fs.IntVar(&opts.workers, "workers", 4, "maximum number of parallel shards/connections")
 	fs.Int64Var(&opts.pagesPerShard, "pages-per-shard", 8192, "target pages (8 KB each) per shard")
 	fs.StringVar(&opts.outDir, "out", "copg-out", "output directory")
@@ -68,7 +53,7 @@ func main() {
 		fmt.Fprintf(fs.Output(), "  copg -conn 'postgres://u:p@localhost/db?sslmode=disable' -table public.users -workers 8 -out ./export\n")
 		fmt.Fprintf(fs.Output(), "  copg -conn 'postgres://u:p@localhost/db?sslmode=disable' -table public.users -format jsonl -prefix users -out ./export\n")
 		fmt.Fprintf(fs.Output(), "  copg -conn 'postgres://u:p@localhost/db?sslmode=disable' -table public.users -format jsonl \\\n")
-		fmt.Fprintf(fs.Output(), "       -column id -column 'lower(email) AS email_lc' -column \"to_char(created_at, 'YYYY-MM-DD') AS created_on\" \\\n")
+		fmt.Fprintf(fs.Output(), "       -select \"id, lower(email) AS email_lc, to_char(created_at, 'YYYY-MM-DD') AS created_on\" \\\n")
 		fmt.Fprintf(fs.Output(), "       -out ./export\n")
 	}
 	fs.Parse(os.Args[1:])
@@ -95,7 +80,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if err := run(ctx, opts, opts.columns); err != nil {
+	if err := run(ctx, opts); err != nil {
 		fmt.Fprintln(os.Stderr, withPrefix(err))
 		os.Exit(1)
 	}
@@ -110,7 +95,7 @@ func withPrefix(err error) string {
 	return "copg: " + msg
 }
 
-func run(ctx context.Context, opts options, columns []string) error {
+func run(ctx context.Context, opts options) error {
 	if err := os.MkdirAll(opts.outDir, 0o755); err != nil {
 		return fmt.Errorf("create output directory: %w", err)
 	}
@@ -118,7 +103,7 @@ func run(ctx context.Context, opts options, columns []string) error {
 	cfg := lib.Config{
 		ConnString:    opts.conn,
 		Table:         opts.table,
-		Columns:       columns,
+		Select:        opts.selectList,
 		Workers:       opts.workers,
 		PagesPerShard: opts.pagesPerShard,
 	}
@@ -141,8 +126,8 @@ func run(ctx context.Context, opts options, columns []string) error {
 
 	fmt.Printf("exporting %s to %s as %s with up to %d workers (%d pages per shard)\n",
 		opts.table, opts.outDir, opts.format, opts.workers, opts.pagesPerShard)
-	if len(columns) > 0 {
-		fmt.Printf("columns: %s\n", strings.Join(columns, ", "))
+	if strings.TrimSpace(opts.selectList) != "" {
+		fmt.Printf("columns: %s\n", opts.selectList)
 	}
 
 	scanner := lib.NewScanner(cfg)

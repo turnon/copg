@@ -23,16 +23,18 @@ type Config struct {
 	// example "public.users").
 	Table string
 
-	// Columns optionally replaces the export's SELECT list. Entries are SQL
-	// expressions evaluated per row against Table and are used verbatim, so
-	// "lower(email)", "id * 2" and "payload->>'k'" all work; an "AS name"
-	// suffix sets the output name that consumers such as JSONLWriter use.
-	// When empty, every live column of the relation is exported.
+	// Select optionally replaces the export's SELECT list with a
+	// comma-separated list of SQL expressions evaluated per row against Table.
+	// Expressions are used verbatim, so "lower(email)", "id * 2" and
+	// "payload->>'k'" all work; an "AS name" suffix sets the output name that
+	// consumers such as JSONLWriter use. Commas inside parentheses, brackets or
+	// quoted strings belong to their expression. When empty, every live column
+	// of the relation is exported.
 	//
 	// Expressions must produce one value per input row: aggregates and window
 	// functions are rejected, because each shard scans a disjoint ctid range
 	// and would evaluate them once per shard.
-	Columns []string
+	Select string
 
 	// Workers is the maximum number of concurrent shard exports, i.e. the
 	// maximum number of PostgreSQL connections opened in parallel. Defaults to
@@ -129,7 +131,7 @@ func (s *Scanner) Run(ctx context.Context) error {
 	}
 
 	// ---------- Phase 2: metadata and ctid planning ----------
-	selectList, cols, err := prepareSelect(ctx, tx, cfg.Table, cfg.Columns)
+	selectList, cols, err := prepareSelect(ctx, tx, cfg.Table, cfg.Select)
 	if err != nil {
 		return err
 	}
@@ -218,11 +220,6 @@ func (c Config) validate() error {
 	}
 	if c.Table == "" {
 		return errors.New("copg: Table is required")
-	}
-	for i, expr := range c.Columns {
-		if strings.TrimSpace(expr) == "" {
-			return fmt.Errorf("copg: Columns[%d] is empty", i)
-		}
 	}
 	if c.ConsumerFactory == nil {
 		return errors.New("copg: no output configured (set ConsumerFactory)")

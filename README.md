@@ -112,25 +112,20 @@ flushes and closes its file.
 
 ## Column selection and expressions
 
-By default every live column is exported, as reported by `pg_attribute`. `Columns` replaces that SELECT list with SQL expressions evaluated per row:
+By default every live column is exported, as reported by `pg_attribute`. `Select` replaces that SELECT list with a comma-separated list of SQL expressions evaluated per row:
 
 ```go
 scanner := copg.NewScanner(copg.Config{
 	ConnString: dsn,
 	Table:      "public.users",
-	Columns: []string{
-		`id`,
-		`lower(email) AS email_lc`,
-		`created_at::date AS created_on`,
-		`payload->>'plan' AS plan`,
-	},
+	Select:     `id, lower(email) AS email_lc, created_at::date AS created_on, payload->>'plan' AS plan`,
 	ConsumerFactory: func(shardID string) (copg.RowConsumer, error) {
 		return copg.NewJSONLFile(shardFileName(shardID) + ".jsonl")
 	},
 })
 ```
 
-Entries are trusted SQL, not identifiers, so function calls, casts and operators all work. Column metadata is then read from the query's own result descriptor (`Prepare` + `FieldDescription.DataTypeOID`) instead of `pg_attribute`, which is what keeps `COPY BINARY` decoding — and therefore `jsonl` output — working for computed columns.
+The list is trusted SQL, not identifiers, so function calls, casts and operators all work. Commas inside parentheses, brackets or quoted strings belong to their expression. Column metadata is then read from the query's own result descriptor (`Prepare` + `FieldDescription.DataTypeOID`) instead of `pg_attribute`, which is what keeps `COPY BINARY` decoding — and therefore `jsonl` output — working for computed columns.
 
 Two constraints follow from sharding by `ctid`:
 
@@ -156,12 +151,10 @@ go run . \
 go run . \
   -conn 'postgres://user:pass@localhost:5432/mydb?sslmode=disable' \
   -table public.users -format jsonl -out ./export \
-  -column id \
-  -column 'lower(email) AS email_lc' \
-  -column "to_char(created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at"
+  -select "id, lower(email) AS email_lc, to_char(created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at"
 ```
 
-Flags: `-conn`, `-table`, `-column`, `-format` (`raw` or `jsonl`), `-out`, `-prefix`, `-workers`, `-pages-per-shard`. `-conn` defaults to `$COPG_CONN`.
+Flags: `-conn`, `-table`, `-select`, `-format` (`raw` or `jsonl`), `-out`, `-prefix`, `-workers`, `-pages-per-shard`. `-conn` defaults to `$COPG_CONN`.
 
 `-format raw` writes `.copy` files containing the untouched `COPY BINARY` stream; `-format jsonl` writes `.jsonl` files with one JSON object per row and the table's column names as keys, decoded through `pgtype` (`copg.NewJSONLFile`).
 
@@ -172,13 +165,15 @@ $ head -1 export/shard.public_users_16384_0_4096.jsonl
 {"id":1,"email":"a@example.com","created_at":"2024-05-06T07:08:09.123Z","score":1.50}
 ```
 
-`-column` takes one SQL expression per occurrence and is repeated once per exported column, in order. Values are never split, so commas, parentheses and quotes inside an expression are preserved verbatim:
+`-select` takes the export's SELECT list as one comma-separated value, in the order the columns should appear:
 
 ```sh
--column id -column "concat(a, b) AS ab" -column "payload->>'x,y' AS v"
+-select "id, concat(a, b) AS ab, payload->>'x,y' AS v"
 ```
 
-Omitting the flag exports every column.
+Commas inside parentheses or brackets, single- or double-quoted strings/identifiers, and dollar-quoted bodies do not separate entries, so `-select "id, to_char(ts, 'YYYY-MM-DD') AS d"` is still two columns. This splitting is only used to point at the offending expression when a column fails; the list itself is passed to PostgreSQL verbatim.
+
+Omitting it exports every column.
 
 ## Notes and limits
 

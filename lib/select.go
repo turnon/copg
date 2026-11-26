@@ -23,22 +23,21 @@ type statementDescriber interface {
 // exactly as pg_attribute reports it. With explicit expressions the result
 // types come from the query's result descriptor instead, because an expression
 // has no pg_attribute entry.
-func prepareSelect(ctx context.Context, tx pgx.Tx, table string, exprs []string) (string, []ColumnMeta, error) {
+func prepareSelect(ctx context.Context, tx pgx.Tx, table, list string) (string, []ColumnMeta, error) {
 	qtable := quoteIdentifier(table)
 
-	if len(exprs) == 0 {
+	if strings.TrimSpace(list) == "" {
 		cols, err := fetchColumnMeta(ctx, tx, table)
 		if err != nil {
 			return "", nil, err
 		}
-		list := make([]string, len(cols))
+		names := make([]string, len(cols))
 		for i, c := range cols {
-			list[i] = quoteIdentifier(c.Name)
+			names[i] = quoteIdentifier(c.Name)
 		}
-		return strings.Join(list, ", "), cols, nil
+		return strings.Join(names, ", "), cols, nil
 	}
 
-	list := strings.Join(exprs, ", ")
 	// The zero-row probe is never executed for data, only prepared and
 	// explained: its result descriptor describes the export.
 	probe := fmt.Sprintf("SELECT %s FROM %s WHERE false", list, qtable)
@@ -52,7 +51,7 @@ func prepareSelect(ctx context.Context, tx pgx.Tx, table string, exprs []string)
 		return checkUniqueNames(cols)
 	})
 	if err != nil {
-		return "", nil, diagnoseSelect(ctx, tx, qtable, exprs, err)
+		return "", nil, diagnoseSelect(ctx, tx, qtable, list, err)
 	}
 
 	// Fast path for the common case: one plan for the whole column list.
@@ -66,7 +65,7 @@ func prepareSelect(ctx context.Context, tx pgx.Tx, table string, exprs []string)
 		return "", nil, err
 	}
 	if kind, bad := nonRowLevel(node); bad {
-		return "", nil, diagnoseSelect(ctx, tx, qtable, exprs, notRowLevelError(kind))
+		return "", nil, diagnoseSelect(ctx, tx, qtable, list, notRowLevelError(kind))
 	}
 
 	if err := fillTypeNames(ctx, tx, cols); err != nil {
@@ -111,7 +110,12 @@ func inSavepoint(ctx context.Context, tx pgx.Tx, fn func(pgx.Tx) error) error {
 // diagnoseSelect probes the expressions one at a time to name the invalid one,
 // or the one that aggregates. It returns cause when no single expression can be
 // blamed.
-func diagnoseSelect(ctx context.Context, tx pgx.Tx, qtable string, exprs []string, cause error) error {
+func diagnoseSelect(ctx context.Context, tx pgx.Tx, qtable, list string, cause error) error {
+	exprs, err := splitSelectList(list)
+	if err != nil {
+		// Blaming the whole list beats a follow-up error about splitting it.
+		return cause
+	}
 	for i, expr := range exprs {
 		probe := fmt.Sprintf("SELECT %s FROM %s WHERE false", expr, qtable)
 		var found error
@@ -197,6 +201,127 @@ func nonRowLevel(node string) (string, bool) {
 	}
 	return "", false
 }
+
+// splitSelectList splits a SELECT list on top-level commas. Commas inside
+// parentheses, brackets, quoted strings/identifiers or dollar-quoted bodies
+// belong to their expression, so "to_char(ts, 'YYYY-MM-DD') AS d" stays one
+// entry. It is used for error attribution: the export itself is passed to
+// PostgreSQL verbatim.
+func splitSelectList(s string) ([]string, error) {
+	var exprs []string
+	start := 0
+	depth := 0
+	brackets := 0
+	for i := 0; i < len(s); {
+		switch c := s[i]; {
+		case c == '\'' || c == '"':
+			q := c
+			i++
+			for i < len(s) {
+				if s[i] != q {
+					i++
+					continue
+				}
+				// A doubled quote is an escaped quote, not the end.
+				if i+1 < len(s) && s[i+1] == q {
+					i += 2
+					continue
+				}
+				break
+			}
+			if i >= len(s) {
+				return nil, fmt.Errorf("unterminated %s quote", quoteName(q))
+			}
+			i++ // closing quote
+		case c == '$' && isDollarQuoteStart(s[i:]):
+			tag := dollarQuoteTag(s[i:])
+			end := strings.Index(s[i+len(tag):], tag)
+			if end < 0 {
+				return nil, fmt.Errorf("unterminated dollar-quoted string %s", tag)
+			}
+			i += len(tag) + end + len(tag)
+		case c == '(':
+			depth++
+			i++
+		case c == ')':
+			depth--
+			if depth < 0 {
+				return nil, errors.New("unbalanced ')' in select list")
+			}
+			i++
+		case c == '[':
+			brackets++
+			i++
+		case c == ']':
+			brackets--
+			if brackets < 0 {
+				return nil, errors.New("unbalanced ']' in select list")
+			}
+			i++
+		case c == ',' && depth == 0 && brackets == 0:
+			exprs = append(exprs, s[start:i])
+			i++
+			start = i
+		default:
+			i++
+		}
+	}
+	if depth != 0 {
+		return nil, errors.New("unbalanced '(' in select list")
+	}
+	if brackets != 0 {
+		return nil, errors.New("unbalanced '[' in select list")
+	}
+	exprs = append(exprs, s[start:])
+
+	out := exprs[:0]
+	for _, expr := range exprs {
+		expr = strings.TrimSpace(expr)
+		if expr == "" {
+			return nil, errors.New("empty column expression")
+		}
+		out = append(out, expr)
+	}
+	return out, nil
+}
+
+func quoteName(q byte) string {
+	if q == '\'' {
+		return "string"
+	}
+	return "identifier"
+}
+
+// isDollarQuoteStart reports whether s begins a dollar-quoted string opener
+// such as "$$" or "$body$". Positional parameters ("$1") do not qualify.
+func isDollarQuoteStart(s string) bool {
+	return dollarQuoteTag(s) != ""
+}
+
+// dollarQuoteTag returns the opening delimiter of the dollar-quoted string at
+// the start of s, or "" when s does not start one.
+func dollarQuoteTag(s string) string {
+	if s == "" || s[0] != '$' {
+		return ""
+	}
+	i := 1
+	if i < len(s) && s[i] == '$' {
+		return "$$"
+	}
+	if i >= len(s) || !(s[i] == '_' || isLetter(s[i])) {
+		return ""
+	}
+	for i < len(s) && (s[i] == '_' || isLetter(s[i]) || isDigit(s[i])) {
+		i++
+	}
+	if i < len(s) && s[i] == '$' {
+		return s[:i+1]
+	}
+	return ""
+}
+
+func isLetter(c byte) bool { return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' }
+func isDigit(c byte) bool  { return c >= '0' && c <= '9' }
 
 // checkUniqueNames rejects duplicate output names: consumers such as
 // JSONLWriter key rows by name, so two columns with the same name would be

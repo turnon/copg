@@ -36,6 +36,13 @@ type Config struct {
 	// and would evaluate them once per shard.
 	Select string
 
+	// Where optionally restricts the exported rows with a SQL predicate, for
+	// example "created_at >= '2024-01-01' AND status = 'active'". The predicate
+	// is trusted SQL, is ANDed with each shard's ctid range, and is prepared
+	// once while planning so a typo fails before any shard starts. When empty,
+	// every row in the relation is exported.
+	Where string
+
 	// Workers is the maximum number of concurrent shard exports, i.e. the
 	// maximum number of PostgreSQL connections opened in parallel. Defaults to
 	// 4. It does not limit the number of shards.
@@ -131,7 +138,7 @@ func (s *Scanner) Run(ctx context.Context) error {
 	}
 
 	// ---------- Phase 2: metadata and ctid planning ----------
-	selectList, cols, err := prepareSelect(ctx, tx, cfg.Table, cfg.Select)
+	selectList, cols, err := prepareSelect(ctx, tx, cfg.Table, cfg.Select, cfg.Where)
 	if err != nil {
 		return err
 	}
@@ -270,26 +277,32 @@ func (s *Scanner) copyWorker(ctx context.Context, snapshotID string, shard Shard
 		return fmt.Errorf("import snapshot: %w", err)
 	}
 
-	sql := buildCopySQL(s.cfg.Table, selectList, shard)
+	sql := buildCopySQL(s.cfg.Table, selectList, s.cfg.Where, shard)
 	return consumer.Consume(ctx, conn, sql, cols)
 }
 
 // buildCopySQL wraps the ctid-filtered SELECT in COPY ... TO STDOUT (FORMAT
 // BINARY). An empty shard uses WHERE false so it returns a valid, empty stream.
 // selectList is resolved by prepareSelect: either every column, or the caller's
-// expressions verbatim.
-func buildCopySQL(table, selectList string, shard Shard) string {
+// expressions verbatim. An optional caller predicate is ANDed with the ctid
+// range and parenthesized, so top-level ORs cannot escape it.
+func buildCopySQL(table, selectList, filter string, shard Shard) string {
 	if selectList == "" {
 		selectList = "*"
 	}
 
-	where := "false"
+	conds := make([]string, 0, 2)
 	if shard.Start < shard.End {
-		where = fmt.Sprintf("ctid >= '(%d,0)'::tid AND ctid < '(%d,0)'::tid", shard.Start, shard.End)
+		conds = append(conds, fmt.Sprintf("ctid >= '(%d,0)'::tid AND ctid < '(%d,0)'::tid", shard.Start, shard.End))
+	} else {
+		conds = append(conds, "false")
+	}
+	if filter = strings.TrimSpace(filter); filter != "" {
+		conds = append(conds, "("+filter+")")
 	}
 
 	return fmt.Sprintf("COPY (SELECT %s FROM %s WHERE %s) TO STDOUT (FORMAT BINARY)",
-		selectList, quoteIdentifier(table), where)
+		selectList, quoteIdentifier(table), strings.Join(conds, " AND "))
 }
 
 // maxShards bounds the number of planned shards so a very large table with a

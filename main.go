@@ -25,6 +25,7 @@ type options struct {
 	conn          string
 	table         string
 	selectList    string
+	where         string
 	workers       int
 	pagesPerShard int64
 	outDir        string
@@ -39,6 +40,7 @@ func main() {
 	fs.StringVar(&opts.conn, "conn", "", "PostgreSQL connection string (default $COPG_CONN)")
 	fs.StringVar(&opts.table, "table", "", "table to export, optionally schema-qualified (required)")
 	fs.StringVar(&opts.selectList, "select", "", "comma-separated SQL expressions to export, e.g. 'id, lower(email) AS email_lc' (default: all columns)")
+	fs.StringVar(&opts.where, "where", "", "SQL predicate selecting rows, e.g. \"status = 'active' AND deleted_at IS NULL\" (default: all rows)")
 	fs.IntVar(&opts.workers, "workers", 4, "maximum number of parallel shards/connections")
 	fs.Int64Var(&opts.pagesPerShard, "pages-per-shard", 8192, "target pages (8 KB each) per shard")
 	fs.StringVar(&opts.outDir, "out", "copg-out", "output directory")
@@ -52,6 +54,8 @@ func main() {
 		fmt.Fprintf(fs.Output(), "  copg -conn 'postgres://u:p@localhost/db?sslmode=disable' -table public.users -format jsonl -out ./export\n")
 		fmt.Fprintf(fs.Output(), "  copg -conn 'postgres://u:p@localhost/db?sslmode=disable' -table public.users -workers 8 -out ./export\n")
 		fmt.Fprintf(fs.Output(), "  copg -conn 'postgres://u:p@localhost/db?sslmode=disable' -table public.users -format jsonl -prefix users -out ./export\n")
+		fmt.Fprintf(fs.Output(), "  copg -conn 'postgres://u:p@localhost/db?sslmode=disable' -table public.users -format jsonl \\\n")
+		fmt.Fprintf(fs.Output(), "       -where \"status = 'active' AND deleted_at IS NULL\" -out ./export\n")
 		fmt.Fprintf(fs.Output(), "  copg -conn 'postgres://u:p@localhost/db?sslmode=disable' -table public.users -format jsonl \\\n")
 		fmt.Fprintf(fs.Output(), "       -select \"id, lower(email) AS email_lc, to_char(created_at, 'YYYY-MM-DD') AS created_on\" \\\n")
 		fmt.Fprintf(fs.Output(), "       -out ./export\n")
@@ -104,6 +108,7 @@ func run(ctx context.Context, opts options) error {
 		ConnString:    opts.conn,
 		Table:         opts.table,
 		Select:        opts.selectList,
+		Where:         opts.where,
 		Workers:       opts.workers,
 		PagesPerShard: opts.pagesPerShard,
 	}
@@ -128,6 +133,9 @@ func run(ctx context.Context, opts options) error {
 		opts.table, opts.outDir, opts.format, opts.workers, opts.pagesPerShard)
 	if strings.TrimSpace(opts.selectList) != "" {
 		fmt.Printf("columns: %s\n", opts.selectList)
+	}
+	if strings.TrimSpace(opts.where) != "" {
+		fmt.Printf("where: %s\n", strings.TrimSpace(opts.where))
 	}
 
 	scanner := lib.NewScanner(cfg)

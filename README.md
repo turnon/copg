@@ -39,6 +39,7 @@ scanner := copg.NewScanner(copg.Config{
 	Table:         "public.users",
 	Workers:       8,
 	PagesPerShard: 2048,
+	Where:         "status = 'active' AND deleted_at IS NULL",
 	ConsumerFactory: func(shardID string) (copg.RowConsumer, error) {
 		f, err := os.Create(shardFileName(shardID) + ".copy")
 		if err != nil {
@@ -134,6 +135,31 @@ Two constraints follow from sharding by `ctid`:
 
 Volatile functions (`random()`, `nextval()`, `clock_timestamp()`) are evaluated once per row and are not reproducible across runs, and `nextval()` consumes sequence values. Generated (`GENERATED ALWAYS AS ... STORED`) columns are ordinary relation columns and need no special treatment.
 
+## Row filtering
+
+`Where` restricts which rows are exported. It is a SQL predicate, passed to PostgreSQL verbatim and ANDed with every shard's `ctid` range:
+
+```go
+scanner := copg.NewScanner(copg.Config{
+	ConnString: dsn,
+	Table:      "public.users",
+	Where:      "status = 'active' AND deleted_at IS NULL",
+	ConsumerFactory: func(shardID string) (copg.RowConsumer, error) {
+		return copg.NewJSONLFile(shardFileName(shardID) + ".jsonl")
+	},
+})
+```
+
+It is trusted SQL like `Select`, so any valid `WHERE` expression works: comparisons, `IS NULL`, `IN (...)`, `LIKE`, subqueries, or calls such as `created_at >= now() - interval '7 days'`. Values need SQL quoting, as in `status = 'active'`; unquoted words are identifiers. The predicate is wrapped in parentheses, so a top-level `OR` cannot widen a shard past its `ctid` range:
+
+```sql
+WHERE ctid >= '(16384,0)'::tid AND ctid < '(32768,0)'::tid AND (status = 'active' OR status = 'pending')
+```
+
+The predicate is prepared once while planning (against a zero-row query), so unknown columns and type errors are reported before any shard starts. Aggregates remain impossible because PostgreSQL does not allow them in `WHERE`. Filtering happens per shard, so `PagesPerShard` still governs read granularity; a highly selective predicate can leave many shards empty, which is expected and cheap.
+
+A shard with no matching rows is not an error: shards are planned from the relation's pages, not from the rows a predicate matches, and every shard still runs its `COPY`. PostgreSQL returns a well-formed stream with zero rows, so a `jsonl` shard file is empty and a `raw` `.copy` shard file contains only the COPY BINARY header and trailer (21 bytes). A predicate that matches nothing produces empty files, not a failure; shard files are still created so the naming and count stay deterministic.
+
 ## CLI
 
 ```sh
@@ -152,9 +178,15 @@ go run . \
   -conn 'postgres://user:pass@localhost:5432/mydb?sslmode=disable' \
   -table public.users -format jsonl -out ./export \
   -select "id, lower(email) AS email_lc, to_char(created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at"
+
+# Only rows matching a predicate
+go run . \
+  -conn 'postgres://user:pass@localhost:5432/mydb?sslmode=disable' \
+  -table public.users -format jsonl -out ./export \
+  -where "status = 'active' AND deleted_at IS NULL"
 ```
 
-Flags: `-conn`, `-table`, `-select`, `-format` (`raw` or `jsonl`), `-out`, `-prefix`, `-workers`, `-pages-per-shard`. `-conn` defaults to `$COPG_CONN`.
+Flags: `-conn`, `-table`, `-select`, `-where`, `-format` (`raw` or `jsonl`), `-out`, `-prefix`, `-workers`, `-pages-per-shard`. `-conn` defaults to `$COPG_CONN`.
 
 `-format raw` writes `.copy` files containing the untouched `COPY BINARY` stream; `-format jsonl` writes `.jsonl` files with one JSON object per row and the table's column names as keys, decoded through `pgtype` (`copg.NewJSONLFile`).
 
@@ -174,6 +206,14 @@ $ head -1 export/shard.public_users_16384_0_4096.jsonl
 Commas inside parentheses or brackets, single- or double-quoted strings/identifiers, and dollar-quoted bodies do not separate entries, so `-select "id, to_char(ts, 'YYYY-MM-DD') AS d"` is still two columns. This splitting is only used to point at the offending expression when a column fails; the list itself is passed to PostgreSQL verbatim.
 
 Omitting it exports every column.
+
+`-where` is the row counterpart, taking one SQL predicate:
+
+```sh
+-where "status = 'active' AND deleted_at IS NULL"
+```
+
+It is ANDed with each shard's `ctid` range and parenthesized, so top-level `OR`s stay inside their shard. See [Row filtering](#row-filtering).
 
 ## Notes and limits
 

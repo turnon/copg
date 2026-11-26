@@ -23,8 +23,21 @@ type statementDescriber interface {
 // exactly as pg_attribute reports it. With explicit expressions the result
 // types come from the query's result descriptor instead, because an expression
 // has no pg_attribute entry.
-func prepareSelect(ctx context.Context, tx pgx.Tx, table, list string) (string, []ColumnMeta, error) {
+//
+// filter is the caller's optional row predicate; it is not part of the SELECT
+// list but is prepared as part of the probe so that an invalid predicate is
+// reported once during planning instead of in every shard.
+func prepareSelect(ctx context.Context, tx pgx.Tx, table, list, filter string) (string, []ColumnMeta, error) {
 	qtable := quoteIdentifier(table)
+	probeFilter := "false"
+	if filter = strings.TrimSpace(filter); filter != "" {
+		probeFilter = fmt.Sprintf("false AND (%s)", filter)
+		// Validate first so a bad predicate is named as such instead of
+		// surfacing as a generic prepare error from the probe below.
+		if err := validateFilter(ctx, tx, qtable, probeFilter); err != nil {
+			return "", nil, err
+		}
+	}
 
 	if strings.TrimSpace(list) == "" {
 		cols, err := fetchColumnMeta(ctx, tx, table)
@@ -40,7 +53,7 @@ func prepareSelect(ctx context.Context, tx pgx.Tx, table, list string) (string, 
 
 	// The zero-row probe is never executed for data, only prepared and
 	// explained: its result descriptor describes the export.
-	probe := fmt.Sprintf("SELECT %s FROM %s WHERE false", list, qtable)
+	probe := fmt.Sprintf("SELECT %s FROM %s WHERE %s", list, qtable, probeFilter)
 
 	var cols []ColumnMeta
 	err := inSavepoint(ctx, tx, func(p pgx.Tx) error {
@@ -72,6 +85,19 @@ func prepareSelect(ctx context.Context, tx pgx.Tx, table, list string) (string, 
 		return "", nil, err
 	}
 	return list, cols, nil
+}
+
+// validateFilter prepares a zero-row query containing filter so PostgreSQL
+// parses and plans it. Preparing is enough to catch unknown columns, type
+// errors and aggregates (which WHERE forbids anyway) without scanning rows.
+func validateFilter(ctx context.Context, tx pgx.Tx, qtable, probeFilter string) error {
+	probe := fmt.Sprintf("SELECT 1 FROM %s WHERE %s", qtable, probeFilter)
+	return inSavepoint(ctx, tx, func(p pgx.Tx) error {
+		if _, err := p.Prepare(ctx, "", probe); err != nil {
+			return fmt.Errorf("copg: where clause: %w", err)
+		}
+		return nil
+	})
 }
 
 // describeSelect returns the result columns of sql without running it.
